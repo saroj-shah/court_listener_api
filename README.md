@@ -1,97 +1,127 @@
-# Court Docket Tracker
+# Court Docket Tracker v2 — AI summarization
 
-A production-minded Python monitor for **CLINIC v. Rubio, 1:26-cv-00858 (S.D.N.Y.)**. It polls CourtListener's v4 docket-entry API, detects new entries and later document attachments, applies transparent impact rules, and posts concise Discord embeds.
+Monitors **CLINIC v. Rubio, 1:26-cv-00858 (S.D.N.Y.)** on CourtListener, downloads the
+filed PDF, summarizes it with an OpenAI model under strict anti-hallucination controls,
+and posts a concise alert to Discord.
 
-> Informational summaries only. This software does not provide legal advice and does not predict outcomes.
+> Informational summaries only. Not legal advice. Every alert links to the source document.
 
-## Features
+## What changed from v1
 
-- CourtListener token authentication
-- New-entry and changed-entry detection
-- SQLite persistence and document-aware fingerprints
-- HIGH / MEDIUM / LOW impact classification
-- Distinguishes a party's motion from a court decision
-- Discord embeds with source links and controlled `@here`
-- HTTP timeout, retry, and 429 handling
-- Dry-run and initialize modes
-- Automated tests
-- GitHub Actions schedule every 30 minutes at minutes 17 and 47
+| | v1 | v2 |
+|---|---|---|
+| Summary text | Raw docket description, truncated | AI summary of the actual PDF |
+| Key points | Template facts | Extracted from document, each quote-verified |
+| PDF | Ignored | Downloaded and text-extracted |
+| Deadlines | None | Extracted when stated in the document |
+| Cost | ₹0 | ~₹0–80/month (see below) |
 
-## 1. Create credentials
+## The anti-hallucination design
 
-1. Create a CourtListener account and copy the API token from the account settings.
-2. In Discord, open the target channel's settings, select **Integrations**, create a webhook, and copy its URL.
-3. Treat both values as secrets.
+This is the part that matters for a legal tracker. Five layers:
 
-## 2. Run locally
+1. **Grounding** — the model only receives text extracted from the filed PDF. No web access, no memory, and it is instructed never to use outside knowledge.
+2. **Structured Outputs** — the response is constrained to a strict JSON schema, so the impact value can only ever be `HIGH`, `MEDIUM`, or `LOW` and required fields can't go missing. <cite>turn8search65</cite>
+3. **Quote verification** — every key point must carry a 10–25 word verbatim quote from the PDF. `summarizer.verify()` normalizes and searches for each quote in the source. **Points whose quotes don't exist are silently deleted.** This is the single most important safeguard — a fabricated claim cannot survive it.
+4. **Confidence downgrade** — if under 50% of points verify, confidence is forced to `LOW`.
+5. **Automatic fallback** — if all points fail, the PDF is a scan, the download fails, or the API errors, the system falls back to the deterministic v1 classifier rather than sending anything unverified.
+
+Plus a hard rule the model cannot override: if `party_request` is true and `court_decision` is false, impact is capped at `MEDIUM`. A motion asking for a stay can never be reported as a stay being granted.
+
+## Model choice
+
+Set `OPENAI_MODEL` in `.env`. The default is `gpt-5.6-terra`, which balances intelligence and cost. Alternatives from the current lineup: `gpt-5.6-luna` (cheapest, $0.20/$1.20 per Mtok), `gpt-5.6-sol` (flagship, $4/$20), `gpt-6-astra` (most capable, $10/$50). <cite>turn8search60</cite><cite>turn8search61</cite>
+
+For docket summarization, **Terra is the right default** — court filings are dense but not reasoning-intensive to summarize, and Luna occasionally blurs the motion-versus-order distinction that matters most here.
+
+## Cost control
+
+Three mechanisms keep the AI bill near zero:
+
+- **`AI_MIN_IMPACT=MEDIUM`** — the free rule-based classifier pre-screens every entry first. Notices of appearance and transcript orders never reach the model.
+- **PDF hash deduplication** — a given PDF is summarized exactly once. Re-runs and metadata changes don't re-bill.
+- **Text cap** — input is capped at 120,000 characters.
+
+Realistic cost: a 30-page filing is roughly 20k input tokens plus ~700 output. At Terra pricing that is about **$0.05 per substantive filing**. This docket sees a handful of qualifying filings per month, so expect **under $1/month**.
+
+## Setup
+
+### 1. Get the API key
+
+Create a key at platform.openai.com, add billing credit, and add to `.env`:
+
+```env
+OPENAI_API_KEY=sk-your-key-here
+OPENAI_MODEL=gpt-5.6-terra
+USE_AI=true
+AI_MIN_IMPACT=MEDIUM
+```
+
+Keep `COURTLISTENER_TOKEN` and `DISCORD_WEBHOOK_URL` as they already are.
+
+### 2. Install and test
 
 ```bash
-python -m venv .venv
+cd court-docket-tracker
 source .venv/bin/activate
 pip install -e .
-cp .env.example .env
-# Edit .env with actual secrets
-```
 
-Initialize the database without sending alerts for every historical filing:
 
-```bash
-docket-tracker --initialize
-```
+#deleting the last row of db
+sqlite3 tracker.db "DELETE FROM entries WHERE rowid IN (SELECT rowid FROM entries ORDER BY first_seen DESC LIMIT 1);"
 
-Test the full formatting without posting to Discord:
 
-```bash
+# dowload db as csv
+sqlite3 -header -csv tracker.db "SELECT * FROM entries;"> entries.csv
+
+#db info table data
+sqlite3 tracker.db "PRAGMA table_info(entries);"
+
+# Preview without posting to Discord and without touching saved state
+rm -f tracker.db
 DRY_RUN=true docket-tracker
 ```
 
-Run normally:
+Look for `"Analysis": "AI summary of filed PDF (...)"` and a `Quote verification` percentage in the output. If you instead see `Docket text only — PDF not analyzed`, the entry had no downloadable PDF on CourtListener — that's expected for many entries and is not an error.
+
+### 3. Go live
 
 ```bash
-docket-tracker
+docket-tracker --initialize   # reset state, no alerts
+docket-tracker                # live
 ```
 
-## 3. Deploy with GitHub Actions
+### 4. GitHub Actions
 
-1. Create a **private GitHub repository** and push this project.
-2. Go to **Settings > Secrets and variables > Actions**.
-3. Add `COURTLISTENER_TOKEN` and `DISCORD_WEBHOOK_URL`.
-4. Open **Actions > Monitor court docket > Run workflow**.
-5. Select `initialize=true` for the first run. This prevents historical-alert spam.
-6. Run again with `initialize=false` to verify normal operation.
+Add a third repository secret, `OPENAI_API_KEY`, alongside the two you already have. The workflow is already wired for it.
 
-The workflow commits `state/tracker.db` to the private repository after each run. For a larger or public deployment, replace this with PostgreSQL or another durable private store.
+Note the schedule is now **hourly** (`17 * * * *`) rather than twice hourly, to stay well inside CourtListener's free-tier limit of 125 requests/day.
 
-## Impact policy
+## Environment variables
 
-- **HIGH:** court-issued order or judgment granting/denying consequential relief, dismissal, final judgment, injunction, stay decision, vacatur, remand, or major merits disposition.
-- **MEDIUM:** a party requests consequential relief, a notice of appeal, substantive briefing, an implementation report, a hearing, or a meaningful scheduling event.
-- **LOW:** appearance, service, transcript, summons, redaction, clerical correction, or other routine administration.
+| Variable | Default | Purpose |
+|---|---|---|
+| `COURTLISTENER_TOKEN` | required | CourtListener API auth |
+| `DISCORD_WEBHOOK_URL` | required unless dry run | Alert destination |
+| `OPENAI_API_KEY` | optional | Enables AI summarization |
+| `OPENAI_MODEL` | `gpt-5.6-terra` | Model ID |
+| `USE_AI` | `true` | Master switch |
+| `AI_MIN_IMPACT` | `MEDIUM` | Minimum pre-screen impact to spend an AI call |
+| `SEND_LOW_IMPACT` | `true` | Send LOW alerts at all |
+| `DRY_RUN` | `false` | Print payload instead of posting |
+| `DB_PATH` | `tracker.db` | SQLite state file |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
 
-The classifier deliberately treats a **motion to stay** as MEDIUM and an **order granting or denying that motion** as HIGH.
-
-## Configuration
-
-Edit `config/cases.yaml` to add another docket. Required keys are `name`, `short_name`, `case_number`, `courtlistener_docket_id`, and `docket_url`.
-
-Environment variables:
-
-- `COURTLISTENER_TOKEN`: required
-- `DISCORD_WEBHOOK_URL`: required unless `DRY_RUN=true`
-- `DB_PATH`: defaults to `tracker.db`
-- `DRY_RUN`: prints payloads instead of sending
-- `SEND_LOW_IMPACT`: defaults to `true`
-
-## Test
+## Tests
 
 ```bash
-pytest -q
+PYTHONPATH=src pytest -q
 ```
 
-## Operational notes
+10 tests cover impact rules, the motion-vs-order distinction, quote verification (including a hallucinated-quote rejection case), PDF-hash deduplication, and Discord field-length limits.
 
-- CourtListener/RECAP can lag PACER. The alert reports only what the API exposes.
-- A filename or external social-media attachment is not treated as an official docket event.
-- Existing entries are re-alerted only when their fingerprint changes, such as when a PDF becomes available.
-- `@here` is used only for HIGH-impact entries that look like court decisions.
-- Review `src/docket_tracker/classifier.py` as the case evolves. Legal event classification is heuristic.
+## Known limits
+
+- Scanned PDFs with no text layer are detected and skipped rather than guessed at; add OCR if you need them.
+- CourtListener/RECAP lags PACER, so a filing may exist on PACER hours before the tracker can see it.
+- Quote verification catches fabricated *evidence*, not a subtly wrong *interpretation* of real text. Always read the linked PDF before acting on a HIGH alert.

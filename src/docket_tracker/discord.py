@@ -1,47 +1,107 @@
 from __future__ import annotations
+
 import time
 from datetime import datetime, timezone
-import httpx
-from .models import DocketEntry, Assessment
 
+import httpx
+
+from .models import Assessment, DocketEntry
+
+BASE = "https://www.courtlistener.com"
 COLORS = {"HIGH": 0xD83C3E, "MEDIUM": 0xF0A500, "LOW": 0x95A5A6}
+DOTS = {"HIGH": "\U0001F534", "MEDIUM": "\U0001F7E0", "LOW": "\u26AA"}
+
+
+def _abs(url: str | None) -> str | None:
+    if not url:
+        return None
+    return url if url.startswith("http") else BASE + url
+
+
+def _clip(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
+
 
 def build_payload(case: dict, entry: DocketEntry, a: Assessment, change: str) -> dict:
-    base = "https://www.courtlistener.com"
-    entry_url = entry.absolute_url or case["docket_url"]
-    if entry_url.startswith("/"):
-        entry_url = base + entry_url
-    doc_links = []
-    for d in entry.documents[:5]:
-        url = d.download_url or d.absolute_url
-        if url and url.startswith("/"):
-            url = base + url
-        if url:
-            doc_links.append(f"[{d.description[:60]}]({url})")
-    fields = [
-        {"name": "Classification", "value": a.category.replace("_", " "), "inline": True},
-        {"name": "Impact", "value": a.impact, "inline": True},
-        {"name": "Confidence", "value": a.confidence, "inline": True},
-        {"name": "Summary", "value": a.summary[:1000] or "No description supplied.", "inline": False},
-        {"name": "Major points", "value": "\n".join(f"• {p}" for p in a.major_points)[:1000], "inline": False},
-        {"name": "Why it matters", "value": a.why_it_matters[:1000], "inline": False},
-        {"name": "Sources", "value": f"[Docket entry]({entry_url}) | [Case docket]({case['docket_url']})" + (("\n" + " | ".join(doc_links)) if doc_links else "\nPDF not available through the API."), "inline": False},
-    ]
-    return {"content": "@here" if a.impact == "HIGH" and a.court_decision else "",
-            "allowed_mentions": {"parse": ["everyone"] if a.impact == "HIGH" and a.court_decision else []},
-            "embeds": [{"title": f"{case['short_name']} | Entry {entry.entry_number} | {a.impact}",
-                        "url": entry_url, "description": f"**{a.title}**\nFiled: {entry.date_filed}\nUpdate type: {change}",
-                        "color": COLORS[a.impact], "fields": fields,
-                        "footer": {"text": "Automated informational summary, not legal advice."},
-                        "timestamp": datetime.now(timezone.utc).isoformat()}]}
+    entry_url = _abs(entry.absolute_url) or case["docket_url"]
 
-def send(webhook_url: str, payload: dict):
+    links = []
+    for d in entry.documents[:4]:
+        url = _abs(d.download_url or d.absolute_url)
+        if url:
+            label = _clip(d.description or "Document", 45)
+            links.append(f"[{label}]({url})")
+
+    fields = [
+        {"name": "Classification", "value": a.category.replace("_", " ").title(), "inline": True},
+        {"name": "Impact", "value": f"{DOTS[a.impact]} {a.impact}", "inline": True},
+        {"name": "Confidence", "value": a.confidence, "inline": True},
+        {"name": "Summary", "value": _clip(a.summary, 1000) or "No description supplied.", "inline": False},
+    ]
+
+    if a.major_points:
+        fields.append({
+            "name": "Key points",
+            "value": _clip("\n".join(f"\u2022 {p}" for p in a.major_points), 1024),
+            "inline": False,
+        })
+    if a.deadlines:
+        fields.append({
+            "name": "Dates and deadlines mentioned",
+            "value": _clip("\n".join(f"\u2022 {d}" for d in a.deadlines), 512),
+            "inline": False,
+        })
+    if a.why_it_matters:
+        fields.append({"name": "Why it matters", "value": _clip(a.why_it_matters, 700), "inline": False})
+
+    posture = (
+        "Court decision" if a.court_decision
+        else "Party request \u2014 not a ruling" if a.party_request
+        else "Docket activity"
+    )
+    fields.append({"name": "Posture", "value": posture, "inline": True})
+
+    if a.source == "ai":
+        analysis = f"AI summary of filed PDF ({a.model})"
+        if a.grounding is not None:
+            analysis += f"\nQuote verification: {int(a.grounding * 100)}%"
+    else:
+        analysis = "Docket text only \u2014 PDF not analyzed"
+    fields.append({"name": "Analysis", "value": analysis, "inline": True})
+
+    sources = f"[Docket entry]({entry_url}) \u2022 [Full docket]({case['docket_url']})"
+    sources += "\n" + (" \u2022 ".join(links) if links else "PDF not yet available on CourtListener.")
+    fields.append({"name": "Sources", "value": _clip(sources, 1024), "inline": False})
+
+    escalate = a.impact == "HIGH" and a.court_decision
+    return {
+        "content": "@here" if escalate else "",
+        "allowed_mentions": {"parse": ["everyone"] if escalate else []},
+        "embeds": [{
+            "title": _clip(f"{case['short_name']} \u2014 Entry {entry.entry_number}", 250),
+            "url": entry_url,
+            "description": _clip(
+                f"**{a.title}**\nFiled: {entry.date_filed}  \u2022  Update: {change}", 400
+            ),
+            "color": COLORS[a.impact],
+            "fields": fields,
+            "footer": {"text": "Automated informational summary \u2014 not legal advice."},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }],
+    }
+
+
+def send(webhook_url: str, payload: dict) -> None:
     for attempt in range(4):
-        r = httpx.post(webhook_url, params={"wait": "true"}, json=payload, timeout=30)
-        if r.status_code == 429:
-            wait = float(r.json().get("retry_after", 1))
-            time.sleep(min(wait, 60)); continue
-        if r.status_code >= 500:
-            time.sleep(2 ** attempt); continue
-        r.raise_for_status(); return
+        response = httpx.post(webhook_url, params={"wait": "true"}, json=payload, timeout=30)
+        if response.status_code == 429:
+            wait = float(response.json().get("retry_after", 1))
+            time.sleep(min(wait, 60))
+            continue
+        if response.status_code >= 500:
+            time.sleep(2 ** attempt)
+            continue
+        response.raise_for_status()
+        return
     raise RuntimeError("Discord delivery failed after retries")

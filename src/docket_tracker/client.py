@@ -1,17 +1,27 @@
 from __future__ import annotations
+
+import logging
 import time
 from typing import Any
+
 import httpx
+
 from .models import DocketEntry, Document
 
+log = logging.getLogger(__name__)
 BASE = "https://www.courtlistener.com/api/rest/v4"
+
 
 class CourtListenerClient:
     def __init__(self, token: str, timeout: float = 30.0):
         if not token:
             raise ValueError("COURTLISTENER_TOKEN is required")
         self.client = httpx.Client(
-            headers={"Authorization": f"Token {token}", "Accept": "application/json", "User-Agent": "court-docket-tracker/1.0"},
+            headers={
+                "Authorization": f"Token {token}",
+                "Accept": "application/json",
+                "User-Agent": "court-docket-tracker/2.0",
+            },
             timeout=timeout,
             follow_redirects=True,
         )
@@ -20,8 +30,9 @@ class CourtListenerClient:
         for attempt in range(4):
             response = self.client.get(url, params=params)
             if response.status_code == 429:
-                wait = float(response.headers.get("Retry-After", "10"))
-                time.sleep(min(wait, 60))
+                wait = float(response.headers.get("Retry-After", "20"))
+                log.warning("Rate limited by CourtListener; sleeping %ss", wait)
+                time.sleep(min(wait, 90))
                 continue
             if response.status_code >= 500:
                 time.sleep(2 ** attempt)
@@ -31,45 +42,54 @@ class CourtListenerClient:
         raise RuntimeError(f"CourtListener request failed after retries: {url}")
 
     @staticmethod
-    def _id_from_resource(value: Any) -> int | str | None:
+    def _id_from(value: Any) -> int | str | None:
         if isinstance(value, int):
             return value
         if isinstance(value, str):
-            parts = [p for p in value.rstrip('/').split('/') if p]
+            parts = [p for p in value.rstrip("/").split("/") if p]
             return int(parts[-1]) if parts and parts[-1].isdigit() else value
         return None
 
-    def get_entries(self, docket_id: int, max_pages: int = 10) -> list[DocketEntry]:
+    def get_entries(self, docket_id: int, max_pages: int = 5) -> list[DocketEntry]:
         url = f"{BASE}/docket-entries/"
-        params: dict[str, Any] | None = {"docket": docket_id, "order_by": "-date_filed,-entry_number", "page_size": 100}
+        params: dict[str, Any] | None = {
+            "docket": docket_id,
+            "order_by": "-date_filed",
+            "page_size": 100,
+        }
         entries: list[DocketEntry] = []
         pages = 0
         while url and pages < max_pages:
             data = self._get(url, params)
             params = None
             for item in data.get("results", []):
-                docs = []
-                for d in item.get("recap_documents", []) or []:
-                    doc_id = d.get("id") or self._id_from_resource(d.get("resource_uri")) or "unknown"
-                    docs.append(Document(
-                        id=doc_id,
-                        description=d.get("description") or d.get("document_type") or "Document",
-                        absolute_url=d.get("absolute_url"),
-                        download_url=d.get("filepath_local") or d.get("download_url"),
-                        page_count=d.get("page_count"),
-                        attachment_number=d.get("attachment_number"),
-                    ))
-                entry_id = item.get("id") or self._id_from_resource(item.get("resource_uri")) or "unknown"
-                entries.append(DocketEntry(
-                    id=entry_id,
-                    entry_number=str(item.get("entry_number") or "Unnumbered"),
-                    date_filed=str(item.get("date_filed") or "Unknown"),
-                    description=(item.get("description") or "").strip(),
-                    absolute_url=item.get("absolute_url"),
-                    date_modified=item.get("date_modified"),
-                    documents=docs,
-                    raw=item,
-                ))
+                documents = []
+                for d in item.get("recap_documents") or []:
+                    local = d.get("filepath_local")
+                    documents.append(
+                        Document(
+                            id=d.get("id") or self._id_from(d.get("resource_uri")) or "unknown",
+                            description=d.get("description")
+                            or d.get("document_type")
+                            or "Document",
+                            absolute_url=d.get("absolute_url"),
+                            download_url=local or d.get("download_url"),
+                            page_count=d.get("page_count"),
+                            is_available=bool(d.get("is_available") or local),
+                        )
+                    )
+                entries.append(
+                    DocketEntry(
+                        id=item.get("id") or self._id_from(item.get("resource_uri")) or "unknown",
+                        entry_number=str(item.get("entry_number") or "Unnumbered"),
+                        date_filed=str(item.get("date_filed") or "Unknown"),
+                        description=(item.get("description") or "").strip(),
+                        absolute_url=item.get("absolute_url"),
+                        date_modified=item.get("date_modified"),
+                        documents=documents,
+                        raw=item,
+                    )
+                )
             url = data.get("next")
             pages += 1
         return entries

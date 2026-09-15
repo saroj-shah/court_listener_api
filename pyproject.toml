@@ -4,9 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "court-docket-tracker"
-version = "1.0.0"
+version = "2.0.0"
 requires-python = ">=3.11"
-dependencies = ["httpx==0.28.1", "pydantic==2.11.7", "PyYAML==6.0.2", "pypdf==5.9.0", "python-dotenv==1.1.1"]
+dependencies = [
+  "httpx>=0.27",
+  "PyYAML>=6.0",
+  "pypdf>=5.0",
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 docket-tracker = "docket_tracker.main:cli"
