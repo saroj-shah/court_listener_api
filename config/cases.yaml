@@ -1,0 +1,8 @@
+cases:
+  - name: "Catholic Legal Immigration Network, Inc. v. Rubio"
+    short_name: "CLINIC v. Rubio"
+    court: "S.D.N.Y."
+    case_number: "1:26-cv-00858"
+    courtlistener_docket_id: 72218277
+    docket_url: "https://www.courtlistener.com/docket/72218277/catholic-legal-immigration-network-inc-v-rubio/"
+    enabled: true
