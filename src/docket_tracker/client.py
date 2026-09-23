@@ -20,7 +20,7 @@ class CourtListenerClient:
             headers={
                 "Authorization": f"Token {token}",
                 "Accept": "application/json",
-                "User-Agent": "court-docket-tracker/2.0",
+                "User-Agent": "court-docket-tracker/3.0",
             },
             timeout=timeout,
             follow_redirects=True,
@@ -50,13 +50,27 @@ class CourtListenerClient:
             return int(parts[-1]) if parts and parts[-1].isdigit() else value
         return None
 
-    def get_entries(self, docket_id: int, max_pages: int = 5) -> list[DocketEntry]:
+    def get_entries(
+        self,
+        docket_id: int,
+        filed_after: str | None = None,
+        max_pages: int = 3,
+    ) -> list[DocketEntry]:
+        """Fetch docket entries, newest first.
+
+        `filed_after` is an ISO date string (YYYY-MM-DD). When supplied, the API
+        is asked to return only entries filed on or after that date, which keeps
+        request payloads small and avoids pulling years of history.
+        """
         url = f"{BASE}/docket-entries/"
         params: dict[str, Any] | None = {
             "docket": docket_id,
             "order_by": "-date_filed",
             "page_size": 100,
         }
+        if filed_after:
+            params["date_filed__gte"] = filed_after
+
         entries: list[DocketEntry] = []
         pages = 0
         while url and pages < max_pages:
@@ -69,13 +83,16 @@ class CourtListenerClient:
                     documents.append(
                         Document(
                             id=d.get("id") or self._id_from(d.get("resource_uri")) or "unknown",
-                            description=d.get("description")
-                            or d.get("document_type")
-                            or "Document",
+                            description=(
+                                d.get("description")
+                                or d.get("document_type")
+                                or "Document"
+                            ),
                             absolute_url=d.get("absolute_url"),
                             download_url=local or d.get("download_url"),
                             page_count=d.get("page_count"),
                             is_available=bool(d.get("is_available") or local),
+                            file_size=d.get("file_size"),
                         )
                     )
                 entries.append(

@@ -1,116 +1,122 @@
-# Court Docket Tracker v2 — AI summarization
+# Court Docket Tracker v3
 
 Monitors **CLINIC v. Rubio, 1:26-cv-00858 (S.D.N.Y.)** on CourtListener, downloads the
-filed PDF, summarizes it with an OpenAI model under strict anti-hallucination controls,
-and posts a concise alert to Discord.
+filed PDF, summarizes it with grounding checks, and posts to Discord with the PDF attached.
 
-> Informational summaries only. Not legal advice. Every alert links to the source document.
+> Informational summaries only. Not legal advice. Every alert links to the source.
 
-## What changed from v1
+## What v3 fixes
 
-| | v1 | v2 |
-|---|---|---|
-| Summary text | Raw docket description, truncated | AI summary of the actual PDF |
-| Key points | Template facts | Extracted from document, each quote-verified |
-| PDF | Ignored | Downloaded and text-extracted |
-| Deadlines | None | Extracted when stated in the document |
-| Cost | ₹0 | ~₹0–80/month (see below) |
+### 1. Old filings were being posted as new (the critical bug)
 
-## The anti-hallucination design
+**Cause:** RECAP is crowd-sourced. When someone with PACER access uploads a document
+for an August entry *today*, CourtListener adds it and the entry's fingerprint changes.
+v2 saw "changed" and alerted — correctly by its own logic, but the result was August
+filings arriving in your Discord in September.
 
-This is the part that matters for a legal tracker. Five layers:
+**Fix:** a recency window. `MAX_AGE_DAYS=21` means any entry filed more than 21 days
+ago is **recorded silently and never alerted**, no matter what changed about it. The
+API is also asked for `date_filed__gte=<cutoff>` so old entries aren't even fetched.
 
-1. **Grounding** — the model only receives text extracted from the filed PDF. No web access, no memory, and it is instructed never to use outside knowledge.
-2. **Structured Outputs** — the response is constrained to a strict JSON schema, so the impact value can only ever be `HIGH`, `MEDIUM`, or `LOW` and required fields can't go missing. <cite>turn8search65</cite>
-3. **Quote verification** — every key point must carry a 10–25 word verbatim quote from the PDF. `summarizer.verify()` normalizes and searches for each quote in the source. **Points whose quotes don't exist are silently deleted.** This is the single most important safeguard — a fabricated claim cannot survive it.
-4. **Confidence downgrade** — if under 50% of points verify, confidence is forced to `LOW`.
-5. **Automatic fallback** — if all points fail, the PDF is a scan, the download fails, or the API errors, the system falls back to the deterministic v1 classifier rather than sending anything unverified.
+Log line when this triggers:
 
-Plus a hard rule the model cannot override: if `party_request` is true and `court_decision` is false, impact is capped at `MEDIUM`. A motion asking for a stay can never be reported as a stay being granted.
+```
+Entry 88 skipped: filed 2026-08-05 (49 days old, limit 21)
+```
 
-## Model choice
+Entries with an unparseable date are never suppressed, so nothing is lost silently.
 
-Set `OPENAI_MODEL` in `.env`. The default is `gpt-5.6-terra`, which balances intelligence and cost. Alternatives from the current lineup: `gpt-5.6-luna` (cheapest, $0.20/$1.20 per Mtok), `gpt-5.6-sol` (flagship, $4/$20), `gpt-6-astra` (most capable, $10/$50). <cite>turn8search60</cite><cite>turn8search61</cite>
+### 2. PDF availability is now stated explicitly
 
-For docket summarization, **Terra is the right default** — court filings are dense but not reasoning-intensive to summarize, and Luna occasionally blurs the motion-versus-order distinction that matters most here.
+Every alert carries a **Document** field with one of five honest states:
 
-## Cost control
+| State | Message |
+|---|---|
+| Downloaded, text extracted | ✅ Available — 12 pages, 1.4 MB. Text extracted and summarized. |
+| Downloaded, image scan | ⚠️ Available, but scanned — no text layer, so it was not summarized. |
+| On docket, not in RECAP | ❌ Not available — listed on the docket, but no free copy in RECAP yet. |
+| No document on the entry | ❌ Not available — no document attached to this docket entry. |
+| Fetch failed | ⚠️ Download failed — marked available but could not be retrieved. |
 
-Three mechanisms keep the AI bill near zero:
+### 3. The PDF itself is attached to the Discord message
 
-- **`AI_MIN_IMPACT=MEDIUM`** — the free rule-based classifier pre-screens every entry first. Notices of appearance and transcript orders never reach the model.
-- **PDF hash deduplication** — a given PDF is summarized exactly once. Re-runs and metadata changes don't re-bill.
-- **Text cap** — input is capped at 120,000 characters.
+Files up to `DISCORD_UPLOAD_LIMIT_MB` (default 8 MB, under Discord's 10 MB free-server
+ceiling) are uploaded via multipart so you can read the filing without leaving Discord.
+Larger files fall back to a link automatically, and a `413` response also falls back
+rather than failing.
 
-Realistic cost: a 30-page filing is roughly 20k input tokens plus ~700 output. At Terra pricing that is about **$0.05 per substantive filing**. This docket sees a handful of qualifying filings per month, so expect **under $1/month**.
+### 4. Old databases upgrade themselves
+
+`StateStore` now runs `PRAGMA table_info` and adds any missing columns. The
+`no such column: pdf_hash` crash cannot recur.
 
 ## Setup
 
-### 1. Get the API key
-
-Create a key at platform.openai.com, add billing credit, and add to `.env`:
-
-```env
-OPENAI_API_KEY=sk-your-key-here
-OPENAI_MODEL=gpt-5.6-terra
-USE_AI=true
-AI_MIN_IMPACT=MEDIUM
-```
-
-Keep `COURTLISTENER_TOKEN` and `DISCORD_WEBHOOK_URL` as they already are.
-
-### 2. Install and test
-
 ```bash
-cd court-docket-tracker
-source .venv/bin/activate
 pip install -e .
-
-
-#deleting the last row of db
-sqlite3 tracker.db "DELETE FROM entries WHERE rowid IN (SELECT rowid FROM entries ORDER BY first_seen DESC LIMIT 1);"
-
-
-# dowload db as csv
-sqlite3 -header -csv tracker.db "SELECT * FROM entries;"> entries.csv
-
-#db info table data
-sqlite3 tracker.db "PRAGMA table_info(entries);"
-
-# Preview without posting to Discord and without touching saved state
-rm -f tracker.db
-DRY_RUN=true docket-tracker
+cp .env.example .env     # fill in your three keys
 ```
 
-Look for `"Analysis": "AI summary of filed PDF (...)"` and a `Quote verification` percentage in the output. If you instead see `Docket text only — PDF not analyzed`, the entry had no downloadable PDF on CourtListener — that's expected for many entries and is not an error.
-
-### 3. Go live
+**Critical first step after upgrading** — reset state so the window applies cleanly:
 
 ```bash
-docket-tracker --initialize   # reset state, no alerts
-docket-tracker                # live
+rm tracker.db
+docket-tracker --initialize
 ```
 
-### 4. GitHub Actions
+Then preview and go live:
 
-Add a third repository secret, `OPENAI_API_KEY`, alongside the two you already have. The workflow is already wired for it.
+```bash
+DRY_RUN=true docket-tracker
+docket-tracker
+```
 
-Note the schedule is now **hourly** (`17 * * * *`) rather than twice hourly, to stay well inside CourtListener's free-tier limit of 125 requests/day.
-
-## Environment variables
+## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `COURTLISTENER_TOKEN` | required | CourtListener API auth |
+| `COURTLISTENER_TOKEN` | required | API auth |
 | `DISCORD_WEBHOOK_URL` | required unless dry run | Alert destination |
 | `OPENAI_API_KEY` | optional | Enables AI summarization |
 | `OPENAI_MODEL` | `gpt-5.6-terra` | Model ID |
-| `USE_AI` | `true` | Master switch |
+| `MAX_AGE_DAYS` | `21` | **Recency window.** Older filings never alert |
+| `ATTACH_PDF` | `true` | Upload the PDF to Discord |
+| `DISCORD_UPLOAD_LIMIT_MB` | `8` | Attachment size ceiling |
+| `USE_AI` | `true` | Master AI switch |
 | `AI_MIN_IMPACT` | `MEDIUM` | Minimum pre-screen impact to spend an AI call |
 | `SEND_LOW_IMPACT` | `true` | Send LOW alerts at all |
-| `DRY_RUN` | `false` | Print payload instead of posting |
-| `DB_PATH` | `tracker.db` | SQLite state file |
-| `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `DRY_RUN` | `false` | Print instead of posting |
+| `DB_PATH` | `tracker.db` | SQLite state |
+
+### Tuning the window
+
+- `MAX_AGE_DAYS=7` — only the last week. Tightest, best if you check daily.
+- `MAX_AGE_DAYS=21` — default. Tolerates a few days of downtime without missing filings.
+- `MAX_AGE_DAYS=60` — loose; you'll see more backfill noise.
+
+### Backfill mode
+
+To deliberately review older entries:
+
+```bash
+DRY_RUN=true docket-tracker --backfill
+```
+
+`--backfill` ignores the window. Never combine it with a live run unless you want
+those older entries posted.
+
+## Anti-hallucination design
+
+1. **Grounding** — the model only sees text extracted from the filed PDF.
+2. **Structured Outputs** — response locked to a strict JSON schema.
+3. **Quote verification** — every point must carry a verbatim quote from the PDF;
+   points whose quotes don't exist are deleted.
+4. **Confidence downgrade** — under 50% verification forces `LOW`.
+5. **Fallback** — any failure reverts to the deterministic classifier.
+
+Plus a hard rule: if the model marks a filing as a party request and not a court
+decision, impact is capped at `MEDIUM`. A motion asking for a stay can never be
+reported as a stay being granted.
 
 ## Tests
 
@@ -118,10 +124,13 @@ Note the schedule is now **hourly** (`17 * * * *`) rather than twice hourly, to 
 PYTHONPATH=src pytest -q
 ```
 
-10 tests cover impact rules, the motion-vs-order distinction, quote verification (including a hallucinated-quote rejection case), PDF-hash deduplication, and Discord field-length limits.
+24 tests covering the recency window (including the August/September boundary),
+all five PDF states, attachment vs. link fallback, Discord field limits, quote
+verification, and v1→v3 database migration.
 
 ## Known limits
 
-- Scanned PDFs with no text layer are detected and skipped rather than guessed at; add OCR if you need them.
-- CourtListener/RECAP lags PACER, so a filing may exist on PACER hours before the tracker can see it.
-- Quote verification catches fabricated *evidence*, not a subtly wrong *interpretation* of real text. Always read the linked PDF before acting on a HIGH alert.
+- Scanned PDFs are flagged, not OCR'd.
+- RECAP lags PACER, so a filing may exist on PACER before the tracker sees it.
+- Quote verification catches fabricated evidence, not a subtly wrong reading of
+  real text. Read the attached PDF before acting on a HIGH alert.

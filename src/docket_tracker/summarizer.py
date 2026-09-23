@@ -1,13 +1,12 @@
 """Grounded AI summarization of court filings.
 
-Design rules that make this safe for legal tracking:
-  1. The model only sees text actually extracted from the filed PDF.
-  2. Output is forced into a strict JSON schema (Structured Outputs).
-  3. Every claim must carry a verbatim `evidence` quote from the source.
-  4. Quotes that do not appear in the source text are dropped.
-  5. If too many points fail verification, the AI result is discarded and the
-     deterministic rule-based classifier is used instead.
-  6. The model is explicitly forbidden from predicting outcomes.
+Safety design:
+  1. The model only sees text extracted from the filed PDF.
+  2. Output is constrained to a strict JSON schema.
+  3. Every point must carry a verbatim quote from the source.
+  4. Quotes that do not appear in the source are deleted.
+  5. If all points fail, the AI result is discarded for the rule-based one.
+  6. The model may never predict outcomes.
 """
 from __future__ import annotations
 
@@ -105,13 +104,7 @@ def verify(result: dict, source_text: str) -> tuple[dict, float]:
         words = quote.split()
         if len(words) < 4:
             continue
-        # Accept exact match, or a high-overlap sliding window match to tolerate
-        # PDF line-break and ligature noise.
-        if quote in haystack:
-            kept.append(item)
-            continue
-        window = " ".join(words[:8])
-        if window in haystack:
+        if quote in haystack or " ".join(words[:8]) in haystack:
             kept.append(item)
     ratio = len(kept) / len(points) if points else 0.0
     result["major_points"] = kept
@@ -126,7 +119,6 @@ def summarize(
     model: str | None = None,
     timeout: float = 120.0,
 ) -> dict | None:
-    """Return a verified summary dict, or None if AI summarization is unusable."""
     if not api_key or not document_text or len(document_text) < 400:
         return None
 
@@ -157,10 +149,7 @@ def summarize(
         try:
             response = httpx.post(
                 API_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json=payload,
                 timeout=timeout,
             )
@@ -201,12 +190,11 @@ def summarize(
 
     result, ratio = verify(result, document_text)
     if not result["major_points"]:
-        log.warning("All AI points failed grounding check; discarding AI summary")
+        log.warning("All AI points failed grounding; discarding AI summary")
         return None
     if ratio < 0.5:
         result["confidence"] = "LOW"
 
-    # Safety net: a party request can never be auto-escalated to HIGH.
     if result.get("party_request") and not result.get("court_decision"):
         if result.get("impact") == "HIGH":
             result["impact"] = "MEDIUM"

@@ -1,9 +1,9 @@
-"""Deterministic fallback classifier, used when no PDF text or AI is available."""
+"""Deterministic classifier. Used for pre-screening and as the AI fallback."""
 from __future__ import annotations
 
 import re
 
-from .models import Assessment, DocketEntry
+from .models import Assessment, DocketEntry, PdfStatus
 
 HIGH_DECISIONS = (
     "final judgment", "preliminary injunction", "temporary restraining order",
@@ -23,12 +23,20 @@ LOW_EVENTS = (
     "mailing", "receipt",
 )
 
+PDF_LABELS = {
+    PdfStatus.NONE_LISTED: "No document attached to this entry (text-only docket entry).",
+    PdfStatus.NOT_AVAILABLE: "Document listed on the docket but no free copy in RECAP yet.",
+    PdfStatus.DOWNLOAD_FAILED: "Document marked available but the download failed.",
+    PdfStatus.SCANNED: "PDF downloaded but it is a scan with no text layer.",
+    PdfStatus.TEXT_READY: "PDF downloaded and text extracted.",
+}
+
 
 def _has(text: str, terms: tuple[str, ...]) -> bool:
     return any(t in text for t in terms)
 
 
-def assess(entry: DocketEntry) -> Assessment:
+def assess(entry: DocketEntry, pdf: PdfStatus | None = None) -> Assessment:
     text = re.sub(r"\s+", " ", entry.description.lower()).strip()
     court_decision = _has(text, COURT_MARKERS) and not text.startswith(("proposed order", "motion"))
     party_request = any(k in text for k in ("motion", "requests", "application", "letter"))
@@ -69,8 +77,8 @@ def assess(entry: DocketEntry) -> Assessment:
     if court_decision:
         points.append("Description indicates a court-issued order or judgment.")
     points.append(f"Docket entry {entry.entry_number}, filed {entry.date_filed}.")
-    available = sum(1 for d in entry.documents if d.is_available)
-    points.append(f"{len(entry.documents)} linked document(s); {available} available to download.")
+    if pdf is not None:
+        points.append(PDF_LABELS.get(pdf.state, "Document status unknown."))
 
     return Assessment(
         category=category,
@@ -87,7 +95,6 @@ def assess(entry: DocketEntry) -> Assessment:
 
 
 def from_ai(result: dict, entry: DocketEntry) -> Assessment:
-    """Convert a verified AI result into an Assessment."""
     points = [p["point"] for p in result.get("major_points", [])]
     evidence = [p["evidence"] for p in result.get("major_points", [])]
     return Assessment(
