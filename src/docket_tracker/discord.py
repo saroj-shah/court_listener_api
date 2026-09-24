@@ -15,32 +15,28 @@ log = logging.getLogger(__name__)
 BASE = "https://www.courtlistener.com"
 COLORS = {"HIGH": 0xD83C3E, "MEDIUM": 0xF0A500, "LOW": 0x95A5A6}
 DOTS = {"HIGH": "\U0001F534", "MEDIUM": "\U0001F7E0", "LOW": "\u26AA"}
-
-# Discord's default upload ceiling for a non-boosted server is 10 MB.
-# Stay under it so the multipart POST is never rejected.
 DEFAULT_UPLOAD_LIMIT = 8 * 1024 * 1024
 
 
 def _abs(url: str | None) -> str | None:
     if not url:
         return None
-    return url if url.startswith("http") else BASE + url
+    return url if str(url).startswith("http") else BASE + str(url)
 
 
-def _clip(text: str, limit: int) -> str:
-    text = (text or "").strip()
+def _clip(text, limit: int) -> str:
+    text = str(text or "").strip()
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
 
 
 def _human_size(num: int) -> str:
-    if num <= 0:
+    if not num or num <= 0:
         return "unknown size"
     mb = num / (1024 * 1024)
-    return f"{mb:.1f} MB" if mb >= 0.1 else f"{num // 1024} KB"
+    return f"{mb:.1f} MB" if mb >= 0.1 else f"{max(num // 1024, 1)} KB"
 
 
 def describe_pdf(pdf: PdfStatus, attached: bool, upload_limit: int) -> str:
-    """Human-readable, honest statement of document availability."""
     if pdf.state == PdfStatus.NONE_LISTED:
         return "\u274C **Not available** \u2014 no document attached to this docket entry."
     if pdf.state == PdfStatus.NOT_AVAILABLE:
@@ -49,9 +45,9 @@ def describe_pdf(pdf: PdfStatus, attached: bool, upload_limit: int) -> str:
             line += f"\n[View entry on CourtListener]({pdf.url})"
         return line
     if pdf.state == PdfStatus.DOWNLOAD_FAILED:
-        line = "\u26A0\uFE0F **Download failed** \u2014 marked available but could not be retrieved."
+        line = "\u26A0\uFE0F **Could not download** \u2014 CourtListener refused the automated request."
         if pdf.url:
-            line += f"\n[Try directly]({pdf.url})"
+            line += f"\n[Open PDF manually]({pdf.url})"
         return line
 
     size = _human_size(pdf.size)
@@ -64,7 +60,7 @@ def describe_pdf(pdf: PdfStatus, attached: bool, upload_limit: int) -> str:
 
     if attached:
         head += "\nPDF attached to this message."
-    elif pdf.size > upload_limit:
+    elif upload_limit and pdf.size > upload_limit:
         head += f"\nToo large to attach (limit {_human_size(upload_limit)}); use the link below."
 
     if pdf.url:
@@ -72,15 +68,7 @@ def describe_pdf(pdf: PdfStatus, attached: bool, upload_limit: int) -> str:
     return head
 
 
-def build_embed(
-    case: dict,
-    entry: DocketEntry,
-    a: Assessment,
-    change: str,
-    pdf: PdfStatus,
-    attached: bool,
-    upload_limit: int,
-) -> dict:
+def build_embed(case, entry, a, change, pdf, attached, upload_limit) -> dict:
     entry_url = _abs(entry.absolute_url) or case["docket_url"]
 
     fields = [
@@ -113,7 +101,7 @@ def build_embed(
 
     posture = (
         "Court decision" if a.court_decision
-        else "Party request \u2014 not a ruling" if a.party_request
+        else "Party filing \u2014 not a ruling" if a.party_request
         else "Docket activity"
     )
     fields.append({"name": "Posture", "value": posture, "inline": True})
@@ -145,19 +133,15 @@ def build_embed(
     }
 
 
-def build_payload(
-    case: dict,
-    entry: DocketEntry,
-    a: Assessment,
-    change: str,
-    pdf: PdfStatus | None = None,
-    upload_limit: int = DEFAULT_UPLOAD_LIMIT,
-) -> tuple[dict, bytes | None, str | None]:
-    """Return (payload, file_bytes, filename). file_bytes is None when nothing is attached."""
+def build_payload(case, entry, a, change, pdf=None, upload_limit=DEFAULT_UPLOAD_LIMIT):
+    """Return (payload, file_bytes, filename)."""
     pdf = pdf or PdfStatus(state=PdfStatus.NONE_LISTED)
 
-    attach = bool(pdf.data) and 0 < pdf.size <= upload_limit
-    filename = safe_filename(entry.entry_number, pdf.document.description if pdf.document else "")
+    attach = bool(pdf.data) and bool(upload_limit) and 0 < pdf.size <= upload_limit
+    filename = safe_filename(
+        entry.entry_number,
+        pdf.document.description if pdf.document else "",
+    )
 
     escalate = a.impact == "HIGH" and a.court_decision
     payload = {
@@ -171,19 +155,12 @@ def build_payload(
     return payload, (pdf.data if attach else None), (filename if attach else None)
 
 
-def send(
-    webhook_url: str,
-    payload: dict,
-    file_bytes: bytes | None = None,
-    filename: str | None = None,
-) -> None:
-    """Post to Discord. Uses multipart when a PDF is attached."""
+def send(webhook_url: str, payload: dict, file_bytes=None, filename=None) -> None:
     for attempt in range(4):
         try:
             if file_bytes and filename:
                 response = httpx.post(
-                    webhook_url,
-                    params={"wait": "true"},
+                    webhook_url, params={"wait": "true"},
                     data={"payload_json": json.dumps(payload)},
                     files={"files[0]": (filename, file_bytes, "application/pdf")},
                     timeout=120,
@@ -205,7 +182,6 @@ def send(
             time.sleep(min(wait, 60))
             continue
         if response.status_code == 413 and file_bytes:
-            # Attachment rejected as too large: retry without the file.
             log.warning("Discord rejected the attachment as too large; sending links only")
             payload.pop("attachments", None)
             return send(webhook_url, payload)

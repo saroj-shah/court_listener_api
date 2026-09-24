@@ -20,20 +20,14 @@ class StateStore:
         self.db = sqlite3.connect(path)
         self.db.execute(
             """CREATE TABLE IF NOT EXISTS entries (
-                docket_id INTEGER NOT NULL,
-                entry_id TEXT NOT NULL,
-                fingerprint TEXT NOT NULL,
-                pdf_hash TEXT,
+                docket_id INTEGER NOT NULL, entry_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL, pdf_hash TEXT,
                 ai_summarized INTEGER NOT NULL DEFAULT 0,
-                date_filed TEXT,
-                pdf_state TEXT,
-                first_seen TEXT NOT NULL,
-                last_seen TEXT NOT NULL,
+                date_filed TEXT, pdf_state TEXT,
+                first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
                 notified INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (docket_id, entry_id))"""
         )
-        # Self-healing migration so an older database upgrades in place
-        # instead of crashing with "no such column".
         existing = {row[1] for row in self.db.execute("PRAGMA table_info(entries)")}
         for column, ddl in SCHEMA_COLUMNS.items():
             if column not in existing:
@@ -49,14 +43,14 @@ class StateStore:
                 for d in entry.documents
             ],
         }
-        blob = json.dumps(data, sort_keys=True, default=str).encode()
-        return hashlib.sha256(blob).hexdigest()
+        return hashlib.sha256(
+            json.dumps(data, sort_keys=True, default=str).encode()
+        ).hexdigest()
 
     def record(self, docket_id: int, entry_id: str):
         return self.db.execute(
             "SELECT fingerprint, pdf_hash, ai_summarized FROM entries "
-            "WHERE docket_id=? AND entry_id=?",
-            (docket_id, str(entry_id)),
+            "WHERE docket_id=? AND entry_id=?", (docket_id, str(entry_id)),
         ).fetchone()
 
     def status(self, docket_id: int, entry: DocketEntry) -> str:
@@ -77,15 +71,9 @@ class StateStore:
             return True
         return bool(pdf_hash) and stored_hash != pdf_hash
 
-    def save(
-        self,
-        docket_id: int,
-        entry: DocketEntry,
-        notified: bool,
-        pdf_hash: str | None = None,
-        ai_summarized: bool = False,
-        pdf_state: str | None = None,
-    ) -> None:
+    def save(self, docket_id: int, entry: DocketEntry, notified: bool,
+             pdf_hash: str | None = None, ai_summarized: bool = False,
+             pdf_state: str | None = None) -> None:
         now = datetime.now(timezone.utc).isoformat()
         self.db.execute(
             """INSERT INTO entries(docket_id, entry_id, fingerprint, pdf_hash,

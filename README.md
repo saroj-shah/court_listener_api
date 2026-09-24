@@ -1,122 +1,123 @@
-# Court Docket Tracker v3
+# Court Docket Tracker v3.1
 
 Monitors **CLINIC v. Rubio, 1:26-cv-00858 (S.D.N.Y.)** on CourtListener, downloads the
 filed PDF, summarizes it with grounding checks, and posts to Discord with the PDF attached.
 
 > Informational summaries only. Not legal advice. Every alert links to the source.
 
-## What v3 fixes
+## What v3.1 fixes
 
-### 1. Old filings were being posted as new (the critical bug)
+### 1. Crash: `TypeError: expected string or bytes-like object, got 'int'`
 
-**Cause:** RECAP is crowd-sourced. When someone with PACER access uploads a document
-for an August entry *today*, CourtListener adds it and the entry's fingerprint changes.
-v2 saw "changed" and alerted — correctly by its own logic, but the result was August
-filings arriving in your Discord in September.
+The run died at Entry 94. CourtListener returned an **integer** where a document
+description was expected, and `safe_filename()` passed it straight to `re.sub()`.
 
-**Fix:** a recency window. `MAX_AGE_DAYS=21` means any entry filed more than 21 days
-ago is **recorded silently and never alerted**, no matter what changed about it. The
-API is also asked for `date_filed__gte=<cutoff>` so old entries aren't even fetched.
+Fixed in two places: `safe_filename()` now coerces both arguments with `str()`, and
+`CourtListenerClient._text()` normalizes every API string field at ingestion so a
+stray int can never reach the formatting layer again.
 
-Log line when this triggers:
+### 2. Every PDF download returned 403
+
+`filepath_local` comes back as a bare path:
 
 ```
-Entry 88 skipped: filed 2026-08-05 (49 days old, limit 21)
+recap/gov.uscourts.nysd.657161/gov.uscourts.nysd.657161.87.0.pdf
 ```
 
-Entries with an unparseable date are never suppressed, so nothing is lost silently.
+v3.0 prefixed that with `www.courtlistener.com`, which **rejects scripted hotlinks
+with 403**. Those files are served from `storage.courtlistener.com`.
 
-### 2. PDF availability is now stated explicitly
+`candidate_urls()` now tries the storage host first, falls back to www, sends a
+browser-style User-Agent and Referer, and attaches your API token. If every
+candidate fails, the alert says *"Could not download — CourtListener refused the
+automated request"* with a manual link, rather than claiming the file was missing.
 
-Every alert carries a **Document** field with one of five honest states:
+### 3. Party filings were labelled "Court decision"
 
-| State | Message |
-|---|---|
-| Downloaded, text extracted | ✅ Available — 12 pages, 1.4 MB. Text extracted and summarized. |
-| Downloaded, image scan | ⚠️ Available, but scanned — no text layer, so it was not summarized. |
-| On docket, not in RECAP | ❌ Not available — listed on the docket, but no free copy in RECAP yet. |
-| No document on the entry | ❌ Not available — no document attached to this docket entry. |
-| Fetch failed | ⚠️ Download failed — marked available but could not be retrieved. |
+Entries 85, 86, 90 and 91 are motions and briefs filed by the parties, but all four
+showed **Posture: Court decision**. The old check matched `"opinion"` or `"judgment"`
+*anywhere* in the text — and `"EMERGENCY MOTION to Enforce Judgment re: 83
+Memorandum & Opinion"` contains both words while being a party filing.
 
-### 3. The PDF itself is attached to the Discord message
+`detect_posture()` now reads how the entry **opens**, which is where federal docket
+text declares its type. Verified against your real entries:
 
-Files up to `DISCORD_UPLOAD_LIMIT_MB` (default 8 MB, under Discord's 10 MB free-server
-ceiling) are uploaded via multipart so you can read the filing without leaving Discord.
-Larger files fall back to a link automatically, and a `413` response also falls back
-rather than failing.
+| Entry | Text begins | v3.0 | v3.1 |
+|---|---|---|---|
+| 83 | OPINION AND ORDER | Court decision | Court decision ✓ |
+| 85 | EMERGENCY MOTION | Court decision ✗ | **Party filing** ✓ |
+| 86 | EMERGENCY MEMORANDUM | Court decision ✗ | **Party filing** ✓ |
+| 87 | ORDER: | Court decision | Court decision ✓ |
+| 90 | RESPONSE to Motion | Court decision ✗ | **Party filing** ✓ |
+| 91 | REPLY MEMORANDUM | Court decision ✗ | **Party filing** ✓ |
 
-### 4. Old databases upgrade themselves
+This also stops false `@here` pings, which only fire on HIGH + court decision.
 
-`StateStore` now runs `PRAGMA table_info` and adds any missing columns. The
-`no such column: pdf_hash` crash cannot recur.
+### 4. Quieter logs and a run summary
 
-## Setup
+`httpx` request logging is silenced, and each run ends with:
+
+```
+Done. alerted=3 skipped_old=11 pdf_ok=2 pdf_failed=1 ai_summaries=2
+```
+
+## Upgrade
 
 ```bash
+cd court-docket-tracker
+# replace src/, tests/, config/, .github/, README.md from the zip
 pip install -e .
-cp .env.example .env     # fill in your three keys
-```
 
-**Critical first step after upgrading** — reset state so the window applies cleanly:
-
-```bash
 rm tracker.db
 docket-tracker --initialize
+DRY_RUN=true docket-tracker      # should print nothing
 ```
 
-Then preview and go live:
+Then verify the PDF fix on one real document:
 
 ```bash
-DRY_RUN=true docket-tracker
-docket-tracker
+DRY_RUN=true docket-tracker --backfill 2>&1 | grep -E "pdf_ok|pdf_failed|Available"
 ```
+
+`pdf_ok` above zero means downloads work now.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `COURTLISTENER_TOKEN` | required | API auth |
+| `COURTLISTENER_TOKEN` | required | API auth, also sent with PDF requests |
 | `DISCORD_WEBHOOK_URL` | required unless dry run | Alert destination |
 | `OPENAI_API_KEY` | optional | Enables AI summarization |
 | `OPENAI_MODEL` | `gpt-5.6-terra` | Model ID |
-| `MAX_AGE_DAYS` | `21` | **Recency window.** Older filings never alert |
+| `MAX_AGE_DAYS` | `21` | Filings older than this never alert |
 | `ATTACH_PDF` | `true` | Upload the PDF to Discord |
-| `DISCORD_UPLOAD_LIMIT_MB` | `8` | Attachment size ceiling |
+| `DISCORD_UPLOAD_LIMIT_MB` | `8` | Attachment ceiling |
 | `USE_AI` | `true` | Master AI switch |
-| `AI_MIN_IMPACT` | `MEDIUM` | Minimum pre-screen impact to spend an AI call |
+| `AI_MIN_IMPACT` | `MEDIUM` | Minimum impact to spend an AI call |
 | `SEND_LOW_IMPACT` | `true` | Send LOW alerts at all |
 | `DRY_RUN` | `false` | Print instead of posting |
 | `DB_PATH` | `tracker.db` | SQLite state |
 
-### Tuning the window
+## Document states
 
-- `MAX_AGE_DAYS=7` — only the last week. Tightest, best if you check daily.
-- `MAX_AGE_DAYS=21` — default. Tolerates a few days of downtime without missing filings.
-- `MAX_AGE_DAYS=60` — loose; you'll see more backfill noise.
-
-### Backfill mode
-
-To deliberately review older entries:
-
-```bash
-DRY_RUN=true docket-tracker --backfill
-```
-
-`--backfill` ignores the window. Never combine it with a live run unless you want
-those older entries posted.
+| State | Discord message |
+|---|---|
+| Downloaded, text extracted | ✅ Available — 12 pages, 1.4 MB. Text extracted and summarized. |
+| Downloaded, image scan | ⚠️ Available, but scanned — no text layer, not summarized. |
+| On docket, not in RECAP | ❌ Not available — no free copy in RECAP yet. |
+| No document on the entry | ❌ Not available — no document attached. |
+| All URLs refused | ⚠️ Could not download — CourtListener refused the automated request. |
 
 ## Anti-hallucination design
 
-1. **Grounding** — the model only sees text extracted from the filed PDF.
-2. **Structured Outputs** — response locked to a strict JSON schema.
-3. **Quote verification** — every point must carry a verbatim quote from the PDF;
-   points whose quotes don't exist are deleted.
-4. **Confidence downgrade** — under 50% verification forces `LOW`.
-5. **Fallback** — any failure reverts to the deterministic classifier.
+1. The model only sees text extracted from the filed PDF.
+2. Output is locked to a strict JSON schema.
+3. Every point must carry a verbatim quote; unmatched quotes are deleted.
+4. Under 50% verification forces confidence to LOW.
+5. Any failure falls back to the deterministic classifier.
 
-Plus a hard rule: if the model marks a filing as a party request and not a court
-decision, impact is capped at `MEDIUM`. A motion asking for a stay can never be
-reported as a stay being granted.
+Hard rule the model cannot override: a party request that is not a court decision
+is capped at MEDIUM impact.
 
 ## Tests
 
@@ -124,13 +125,15 @@ reported as a stay being granted.
 PYTHONPATH=src pytest -q
 ```
 
-24 tests covering the recency window (including the August/September boundary),
-all five PDF states, attachment vs. link fallback, Discord field limits, quote
-verification, and v1→v3 database migration.
+34 tests. Regression coverage for all three v3.1 bugs: `test_posture.py` replays the
+real misclassified entries, `test_pdf_urls.py` covers the storage-host resolution and
+the int-description crash, `test_recency.py` covers the August/September boundary.
 
 ## Known limits
 
 - Scanned PDFs are flagged, not OCR'd.
-- RECAP lags PACER, so a filing may exist on PACER before the tracker sees it.
-- Quote verification catches fabricated evidence, not a subtly wrong reading of
-  real text. Read the attached PDF before acting on a HIGH alert.
+- RECAP lags PACER; a filing may exist on PACER before the tracker sees it.
+- Some documents are genuinely PACER-only and will never download. That is reported
+  honestly rather than guessed at.
+- Quote verification catches fabricated evidence, not a subtly wrong reading of real
+  text. Read the attached PDF before acting on a HIGH alert.

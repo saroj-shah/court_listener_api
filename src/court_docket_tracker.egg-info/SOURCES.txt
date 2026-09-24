@@ -15,9 +15,9 @@ src/docket_tracker/models.py
 src/docket_tracker/pdf_extractor.py
 src/docket_tracker/state.py
 src/docket_tracker/summarizer.py
-tests/test_classifier.py
 tests/test_discord.py
-tests/test_pdf_status.py
+tests/test_pdf_urls.py
+tests/test_posture.py
 tests/test_recency.py
 tests/test_state.py
 tests/test_summarizer.py

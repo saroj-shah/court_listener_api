@@ -16,11 +16,12 @@ class CourtListenerClient:
     def __init__(self, token: str, timeout: float = 30.0):
         if not token:
             raise ValueError("COURTLISTENER_TOKEN is required")
+        self.token = token
         self.client = httpx.Client(
             headers={
                 "Authorization": f"Token {token}",
                 "Accept": "application/json",
-                "User-Agent": "court-docket-tracker/3.0",
+                "User-Agent": "court-docket-tracker/3.1",
             },
             timeout=timeout,
             follow_redirects=True,
@@ -50,18 +51,20 @@ class CourtListenerClient:
             return int(parts[-1]) if parts and parts[-1].isdigit() else value
         return None
 
+    @staticmethod
+    def _text(value: Any, fallback: str = "") -> str:
+        """Coerce any API value to a string. Guards against ints in description."""
+        if value is None:
+            return fallback
+        text = str(value).strip()
+        return text or fallback
+
     def get_entries(
         self,
         docket_id: int,
         filed_after: str | None = None,
         max_pages: int = 3,
     ) -> list[DocketEntry]:
-        """Fetch docket entries, newest first.
-
-        `filed_after` is an ISO date string (YYYY-MM-DD). When supplied, the API
-        is asked to return only entries filed on or after that date, which keeps
-        request payloads small and avoids pulling years of history.
-        """
         url = f"{BASE}/docket-entries/"
         params: dict[str, Any] | None = {
             "docket": docket_id,
@@ -83,10 +86,8 @@ class CourtListenerClient:
                     documents.append(
                         Document(
                             id=d.get("id") or self._id_from(d.get("resource_uri")) or "unknown",
-                            description=(
-                                d.get("description")
-                                or d.get("document_type")
-                                or "Document"
+                            description=self._text(
+                                d.get("description") or d.get("document_type"), "Document"
                             ),
                             absolute_url=d.get("absolute_url"),
                             download_url=local or d.get("download_url"),
@@ -98,9 +99,9 @@ class CourtListenerClient:
                 entries.append(
                     DocketEntry(
                         id=item.get("id") or self._id_from(item.get("resource_uri")) or "unknown",
-                        entry_number=str(item.get("entry_number") or "Unnumbered"),
-                        date_filed=str(item.get("date_filed") or "Unknown"),
-                        description=(item.get("description") or "").strip(),
+                        entry_number=self._text(item.get("entry_number"), "Unnumbered"),
+                        date_filed=self._text(item.get("date_filed"), "Unknown"),
+                        description=self._text(item.get("description")),
                         absolute_url=item.get("absolute_url"),
                         date_modified=item.get("date_modified"),
                         documents=documents,

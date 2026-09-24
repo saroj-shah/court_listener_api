@@ -1,13 +1,4 @@
-"""Grounded AI summarization of court filings.
-
-Safety design:
-  1. The model only sees text extracted from the filed PDF.
-  2. Output is constrained to a strict JSON schema.
-  3. Every point must carry a verbatim quote from the source.
-  4. Quotes that do not appear in the source are deleted.
-  5. If all points fail, the AI result is discarded for the rule-based one.
-  6. The model may never predict outcomes.
-"""
+"""Grounded AI summarization of court filings."""
 from __future__ import annotations
 
 import json
@@ -91,11 +82,10 @@ SCHEMA = {
 
 
 def _normalize(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]", " ", re.sub(r"\s+", " ", text.lower())).strip()
+    return re.sub(r"[^a-z0-9 ]", " ", re.sub(r"\s+", " ", str(text).lower())).strip()
 
 
 def verify(result: dict, source_text: str) -> tuple[dict, float]:
-    """Drop unsupported points. Return (filtered_result, grounding_ratio)."""
     haystack = _normalize(source_text)
     points = result.get("major_points") or []
     kept = []
@@ -111,37 +101,24 @@ def verify(result: dict, source_text: str) -> tuple[dict, float]:
     return result, ratio
 
 
-def summarize(
-    document_text: str,
-    entry_description: str,
-    case_name: str,
-    api_key: str,
-    model: str | None = None,
-    timeout: float = 120.0,
-) -> dict | None:
+def summarize(document_text, entry_description, case_name, api_key,
+              model=None, timeout: float = 120.0):
     if not api_key or not document_text or len(document_text) < 400:
         return None
 
     model = model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
-    user_content = (
-        f"CASE: {case_name}\n"
-        f"DOCKET ENTRY DESCRIPTION: {entry_description or 'Not provided'}\n\n"
-        f"--- BEGIN DOCUMENT TEXT ---\n{document_text}\n--- END DOCUMENT TEXT ---"
-    )
     payload = {
         "model": model,
         "input": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": (
+                f"CASE: {case_name}\n"
+                f"DOCKET ENTRY DESCRIPTION: {entry_description or 'Not provided'}\n\n"
+                f"--- BEGIN DOCUMENT TEXT ---\n{document_text}\n--- END DOCUMENT TEXT ---"
+            )},
         ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "docket_filing_summary",
-                "strict": True,
-                "schema": SCHEMA,
-            }
-        },
+        "text": {"format": {"type": "json_schema", "name": "docket_filing_summary",
+                            "strict": True, "schema": SCHEMA}},
     }
 
     raw = None
@@ -149,9 +126,9 @@ def summarize(
         try:
             response = httpx.post(
                 API_URL,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=timeout,
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json=payload, timeout=timeout,
             )
         except Exception as exc:
             log.warning("AI request error: %s", exc)
@@ -194,7 +171,6 @@ def summarize(
         return None
     if ratio < 0.5:
         result["confidence"] = "LOW"
-
     if result.get("party_request") and not result.get("court_decision"):
         if result.get("impact") == "HIGH":
             result["impact"] = "MEDIUM"
